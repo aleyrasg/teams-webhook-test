@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// scope-map de juguete: imita el contrato de org-config (scope → producto).
+console.log(JSON.stringify({ api: "visionx", web: "visionx", infra: "platform", docs: null }));

@@ -1,0 +1,123 @@
+name: PR ready (copia de prueba)
+
+# Copia de org-config/.github/workflows/pr-ready.yml para probarla en un repo personal
+# (un repo personal no puede llamar al workflow reusable de una org privada).
+# Diferencias: corre con pull_request directo y product-labels está fijo en true.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, edited, labeled, unlabeled, assigned, unassigned, review_requested, review_request_removed, synchronize]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  ready:
+    name: PR ready
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pr-ready-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+        if: true
+
+      - name: Derive scope → product map from the repo's scope-map
+        id: scopes
+        if: true
+        run: |
+          if [ ! -x ./.guia/scope-map ]; then
+            echo "::error::./.guia/scope-map not found or not executable — required when product-labels is on"
+            exit 1
+          fi
+          echo "map=$(./.guia/scope-map | node -e "process.stdout.write(JSON.stringify(JSON.parse(require('fs').readFileSync(0, 'utf8'))))")" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/github-script@v7
+        env:
+          SCOPE_MAP: ${{ steps.scopes.outputs.map }}
+          PRODUCT_LABELS: ${{ true }}
+        with:
+          script: |
+            const MARKER = '<!-- pr-ready -->';
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const issue_number = pull_number;
+
+            // Fresh state — not the event snapshot; robust to rapid edits.
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+            if (pr.user.type === 'Bot') {
+              core.info(`bot-authored PR (@${pr.user.login}) — exempt`);
+              return;
+            }
+            const problems = [];
+
+            // ── assignee ─────────────────────────────────────────────────
+            let assignees = pr.assignees.map((a) => a.login);
+            if (!assignees.length) {
+              await github.rest.issues.addAssignees({ owner, repo, issue_number, assignees: [pr.user.login] });
+              assignees = [pr.user.login];
+              core.info(`auto-assigned the author @${pr.user.login}`);
+            }
+
+            // ── reviewer: requested OR already reviewed ──────────────────
+            const requested = pr.requested_reviewers.length + pr.requested_teams.length;
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number });
+            const reviewed = reviews.filter((r) => r.user && r.user.login !== pr.user.login).length;
+            if (requested + reviewed === 0) {
+              problems.push('**Reviewer** — request at least one (right column → Reviewers). They get tagged in the Teams notification.');
+            }
+
+            // ── product label (multi-product repos) ──────────────────────
+            if (process.env.PRODUCT_LABELS === 'true') {
+              const scopeMap = JSON.parse(process.env.SCOPE_MAP || '{}');
+              const buckets = [...new Set(Object.values(scopeMap).filter(Boolean))].map((p) => `product:${p}`);
+              let present = pr.labels.map((l) => l.name).filter((n) => buckets.includes(n));
+
+              // Auto-label only into an EMPTY state — never fight a label a human chose.
+              const scopes = (pr.title.match(/^\w+\(([^)]+)\)!?:/)?.[1] ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+              const fromTitle = [...new Set(scopes.map((s) => scopeMap[s]).filter(Boolean))];
+              if (present.length === 0 && fromTitle.length === 1) {
+                const label = `product:${fromTitle[0]}`;
+                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [label] });
+                present = [label];
+                core.info(`auto-labeled ${label} from title scopes (${scopes.join(', ')})`);
+              }
+
+              const bucketList = buckets.map((b) => `\`${b}\``).join(', ');
+              if (present.length === 0) {
+                const why = fromTitle.length > 1
+                  ? `The title's scopes span several products (${fromTitle.map((p) => `\`product:${p}\``).join(', ')}), so I can't pick one.`
+                  : "I couldn't derive one from the title's scopes.";
+                problems.push(`**Product label** — ${why} Add **exactly one** of: ${bucketList} — the narrowest bucket that covers all consumers. It routes the Teams notification to that product's channel.`);
+              } else if (present.length > 1) {
+                problems.push(`**Product label** — it carries ${present.map((p) => `\`${p}\``).join(', ')}. Keep exactly one.`);
+              }
+            }
+
+            // ── one sticky comment: created/updated while not ready, removed once ready ──
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const sticky = comments.find((c) => c.user?.type === 'Bot' && c.body?.includes(MARKER));
+
+            if (!problems.length) {
+              if (sticky) await github.rest.issues.deleteComment({ owner, repo, comment_id: sticky.id });
+              core.info('ready');
+              return;
+            }
+
+            const body = [
+              MARKER,
+              '### 🚦 This PR is not ready yet',
+              '',
+              ...problems.map((p) => `- ${p}`),
+              '',
+              "I'll update this check (and remove this comment) as soon as it's fixed.",
+            ].join('\n');
+            if (sticky) {
+              if (sticky.body !== body) await github.rest.issues.updateComment({ owner, repo, comment_id: sticky.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+            core.setFailed(problems.map((p) => p.replace(/\*\*/g, '')).join('\n'));
